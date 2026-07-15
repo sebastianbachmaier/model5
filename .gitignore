@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data (token shards, downloaded datasets)
+data/
+*.bin
+*.jsonl
+
+# Checkpoints / model weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# HuggingFace / torch caches
+.cache/
+huggingface/
+
+# torch.compile / inductor cache
+/tmp/torchinductor_*
+
+# Logs
+*.log
+wandb/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
