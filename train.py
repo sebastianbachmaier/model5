@@ -82,6 +82,17 @@ def save_checkpoint(path, raw_model, optimizer, step, config: ModelConfig):
     )
 
 
+def prune_old_checkpoints(out_dir, keep_last):
+    """Delete periodic ckpt_<step>.pt files beyond the most recent `keep_last`,
+    so disk usage stays bounded on long runs. Never touches ckpt_final.pt."""
+    ckpts = sorted(
+        f for f in os.listdir(out_dir)
+        if f.startswith("ckpt_") and f.endswith(".pt") and f != "ckpt_final.pt"
+    )
+    for f in ckpts[:-keep_last] if keep_last > 0 else ckpts:
+        os.remove(os.path.join(out_dir, f))
+
+
 def main():
     parser = argparse.ArgumentParser()
     # model
@@ -109,6 +120,9 @@ def main():
     # logging / checkpointing
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--ckpt_interval", type=int, default=1000)
+    parser.add_argument("--keep_last_ckpts", type=int, default=5,
+                         help="number of periodic checkpoints to retain (0 = keep all); "
+                              "ckpt_final.pt is always kept regardless")
     parser.add_argument("--out_dir", type=str, default="checkpoints/pretrain")
     parser.add_argument("--resume", type=str, default=None)
     # misc
@@ -224,6 +238,7 @@ def main():
             path = os.path.join(args.out_dir, f"ckpt_{step:07d}.pt")
             save_checkpoint(path, raw_model, optimizer, step, config)
             print(f"saved checkpoint -> {path}")
+            prune_old_checkpoints(args.out_dir, args.keep_last_ckpts)
 
     if master:
         path = os.path.join(args.out_dir, "ckpt_final.pt")

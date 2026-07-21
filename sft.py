@@ -113,7 +113,7 @@ def setup_ddp():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_checkpoint", type=str, required=True)
-    parser.add_argument("--tokenizer", type=str, default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--tokenizer", type=str, default="gpt2")
     parser.add_argument("--data", type=str, required=True, help="JSONL file of {'messages': [...]}")
     parser.add_argument("--max_len", type=int, default=2048)
     parser.add_argument("--micro_bsz", type=int, default=8)

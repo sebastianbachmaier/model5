@@ -1,6 +1,6 @@
 """
 data_prep.py — stream HuggingFaceFW/fineweb-edu (sample-100BT), tokenize with
-the Llama-3.2 tokenizer, and pack tokens end-to-end into flat uint16 .bin
+the SmolLM2 tokenizer, and pack tokens end-to-end into flat uint16 .bin
 shards of ~100M tokens each.
 
 Usage:
@@ -34,6 +34,11 @@ _eos_id = None
 def _init_worker(tokenizer_name: str):
     global _tokenizer, _eos_id
     _tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    # We tokenize whole documents with no truncation and pack them end-to-end
+    # ourselves, so the tokenizer's default model_max_length (its notion of a
+    # model's context window) is irrelevant here. Raise it so HF stops
+    # emitting a "sequence length is longer than..." warning per long doc.
+    _tokenizer.model_max_length = int(1e12)
     _eos_id = _tokenizer.eos_token_id
     assert _eos_id is not None, "tokenizer has no eos_token_id"
 
@@ -48,7 +53,7 @@ def _tokenize(example) -> np.ndarray:
 def assert_vocab_fits_uint16(vocab_size: int):
     assert vocab_size <= 65535, (
         f"tokenizer vocab size {vocab_size} does not fit in uint16 (max 65535). "
-        "NOTE: meta-llama/Llama-3.2-1B's tokenizer actually has ~128k tokens, "
+        "NOTE: gated tokenizers like meta-llama/Llama-3.2-1B have ~128k tokens, "
         "which does NOT satisfy this constraint out of the box. Either (a) use "
         "a smaller-vocab tokenizer, or (b) change the .bin dtype to uint32 "
         "everywhere in this file and in data.py (doubles on-disk size, removes "
@@ -64,7 +69,7 @@ def write_shard(buf: np.ndarray, count: int, out_dir: str, shard_idx: int) -> st
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokenizer", type=str, default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--tokenizer", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu")
     parser.add_argument("--subset", type=str, default="sample-100BT")
     parser.add_argument("--out_dir", type=str, default="data/fineweb_edu")

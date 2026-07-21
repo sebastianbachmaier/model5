@@ -116,7 +116,7 @@ def chat_turn(model, tokenizer, messages, args, device, stop_ids):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--tokenizer", type=str, default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--tokenizer", type=str, default="gpt2")
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=0.9)
