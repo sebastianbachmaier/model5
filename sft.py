@@ -27,6 +27,7 @@ Launch:
         --data data/sft/train.jsonl --out_dir checkpoints/sft
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -34,6 +35,7 @@ import os
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from chat_template import add_special_tokens, render_message
@@ -59,20 +61,42 @@ def build_example(messages, tokenizer, max_len, add_bos=True):
     return input_ids[:max_len], is_assistant[:max_len]
 
 
+def _cache_path(data_path, tokenizer, max_len):
+    # Cache key covers everything that changes tokenization output: the
+    # data file's own content (mtime+size is enough, cheap to check),
+    # tokenizer vocab (len(tokenizer) captures added special tokens), and
+    # max_len (truncation point).
+    stat = os.stat(data_path)
+    key = f"{data_path}:{stat.st_mtime_ns}:{stat.st_size}:{len(tokenizer)}:{max_len}"
+    digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+    return f"{data_path}.tokcache_{digest}.pt"
+
+
 class SFTDataset(Dataset):
-    def __init__(self, path, tokenizer, max_len):
+    def __init__(self, path, tokenizer, max_len, cache_path=None, verbose=True):
         self.max_len = max_len
         self.pad_id = tokenizer.pad_token_id
+        if cache_path and os.path.exists(cache_path):
+            if verbose:
+                print(f"[sft data] loading cached tokenized dataset from {cache_path}")
+            self.examples = torch.load(cache_path)
+            return
         self.examples = []
         with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                ids, is_assistant = build_example(obj["messages"], tokenizer, max_len)
-                if any(is_assistant):  # skip conversations with no trainable tokens
-                    self.examples.append((ids, is_assistant))
+            lines = f.readlines()
+        iterator = tqdm(lines, desc="tokenizing SFT data", unit="convo") if verbose else lines
+        for line in iterator:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            ids, is_assistant = build_example(obj["messages"], tokenizer, max_len)
+            if any(is_assistant):  # skip conversations with no trainable tokens
+                self.examples.append((ids, is_assistant))
+        if cache_path:
+            torch.save(self.examples, cache_path)
+            if verbose:
+                print(f"[sft data] cached tokenized dataset -> {cache_path}")
 
     def __len__(self):
         return len(self.examples)
@@ -164,7 +188,18 @@ def main():
     if is_ddp:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
 
-    dataset = SFTDataset(args.data, tokenizer, args.max_len)
+    # Tokenizing the whole file is CPU-bound and identical across ranks, so
+    # only rank 0 does it (with a progress bar) and writes a cache keyed off
+    # the data file + tokenizer + max_len; other ranks wait at the barrier
+    # and then just load that cache instead of redundantly re-tokenizing.
+    cache_path = _cache_path(args.data, tokenizer, args.max_len)
+    if is_ddp:
+        if master:
+            SFTDataset(args.data, tokenizer, args.max_len, cache_path=cache_path, verbose=True)
+        dist.barrier()
+        dataset = SFTDataset(args.data, tokenizer, args.max_len, cache_path=cache_path, verbose=master)
+    else:
+        dataset = SFTDataset(args.data, tokenizer, args.max_len, cache_path=cache_path)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed) if is_ddp else None
     loader = DataLoader(
         dataset, batch_size=args.micro_bsz, sampler=sampler,

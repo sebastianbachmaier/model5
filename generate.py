@@ -37,11 +37,34 @@ def load_model(checkpoint_path, device, tokenizer=None):
     return model
 
 
-def sample_token(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
-    """logits: (1, vocab). Greedy if temperature == 0, else temperature +
-    nucleus (top-p) sampling."""
+def apply_repetition_penalty(logits: torch.Tensor, seen_ids: set, penalty: float) -> torch.Tensor:
+    """HF-style repetition penalty: shrink the logit of any token already seen
+    in the prompt+generation so far towards zero (divide positive logits,
+    multiply negative ones), discouraging the model from re-selecting it.
+    penalty == 1.0 is a no-op. This directly counters the "answers the same
+    question over and over" loop an undertrained model can fall into when it
+    doesn't confidently predict the stop token."""
+    if penalty == 1.0 or not seen_ids:
+        return logits
+    idx = torch.tensor(list(seen_ids), device=logits.device, dtype=torch.long)
+    seen = logits[:, idx]
+    logits[:, idx] = torch.where(seen > 0, seen / penalty, seen * penalty)
+    return logits
+
+
+def sample_token(logits: torch.Tensor, temperature: float, top_p: float, top_k: int = 0) -> torch.Tensor:
+    """logits: (1, vocab). Greedy if temperature == 0, else top-k (if top_k >
+    0) then temperature + nucleus (top-p) sampling. top_k is applied first
+    since it's a hard cap on how many candidates are ever considered --
+    useful on a poorly-calibrated (e.g. undertrained) model whose
+    distribution is flat enough that top-p alone still leaves a very long,
+    low-probability tail available to sample from."""
     if temperature <= 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
+    if top_k and top_k > 0:
+        top_k = min(top_k, logits.size(-1))
+        kth_val = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < kth_val, float("-inf"))
     logits = logits / temperature
     probs = F.softmax(logits, dim=-1)
     sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
@@ -56,19 +79,60 @@ def sample_token(logits: torch.Tensor, temperature: float, top_p: float) -> torc
 
 
 @torch.no_grad()
-def generate(model, prompt_ids, max_new_tokens, temperature, top_p, device, stop_ids):
-    """Autoregressive generation with a KV cache. The cache only stores the
-    n_kv_heads (not n_heads) K/V tensors per layer, exploiting GQA to cut
-    cache memory by n_heads/n_kv_heads (4x for the default config)."""
+def generate(model, prompt_ids, max_new_tokens, temperature, top_p, device, stop_ids, use_kv_cache=True,
+             repetition_penalty=1.0, compute_dtype=torch.bfloat16, top_k=0):
+    """Autoregressive generation. By default uses a KV cache (the n_kv_heads,
+    not n_heads, K/V tensors per layer, exploiting GQA to cut cache memory by
+    n_heads/n_kv_heads -- 4x for the default config). If use_kv_cache=False,
+    instead recomputes the full sequence from scratch on every step (O(n^2),
+    much slower) -- this exactly matches the numerics training uses and
+    avoids small bf16 rounding differences between the cached single-token
+    SDPA call and a full-sequence SDPA call. Those differences are usually
+    negligible, but can get amplified by an early/undertrained model's less
+    stable representations, degrading a cached checkpoint's generations far
+    more than its no-cache/teacher-forced quality would suggest -- use
+    use_kv_cache=False to sanity-check a checkpoint's real quality without
+    that artifact, at the cost of much slower generation.
+
+    compute_dtype controls both the autocast precision and the KV cache's
+    storage dtype (previously hardcoded to bf16 regardless of what was
+    requested here) -- pass torch.float32 to disable autocast entirely for
+    the most numerically faithful (but slowest) comparison point, e.g. to
+    check whether bf16 rounding is responsible for a quality gap vs. some
+    other (e.g. fp16) inference engine on the same checkpoint."""
     config = model.config
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    autocast_enabled = compute_dtype != torch.float32
+    dtype_ctx = torch.autocast(device_type=device_type, dtype=compute_dtype, enabled=autocast_enabled)
+    seen_ids = set(prompt_ids)
+
+    if not use_kv_cache:
+        tokens = list(prompt_ids)
+        generated = []
+        for _ in range(max_new_tokens):
+            if len(tokens) >= config.max_seq_len:
+                break
+            input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            with dtype_ctx:
+                logits, _ = model(input_ids, kv_caches=None, start_pos=0)
+            next_logits = logits[:, -1, :].float()
+            next_logits = apply_repetition_penalty(next_logits, seen_ids, repetition_penalty)
+            next_id = sample_token(next_logits, temperature, top_p, top_k)
+            tok = next_id.item()
+            if tok in stop_ids:
+                break
+            generated.append(tok)
+            tokens.append(tok)
+            seen_ids.add(tok)
+        return generated
+
     head_dim = config.dim // config.n_heads
     kv_caches = [
-        KVCache(1, config.max_seq_len, config.n_kv_heads, head_dim, device, torch.bfloat16)
+        KVCache(1, config.max_seq_len, config.n_kv_heads, head_dim, device, compute_dtype)
         for _ in range(config.n_layers)
     ]
 
     tokens = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    dtype_ctx = torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16)
 
     with dtype_ctx:
         logits, _ = model(tokens, kv_caches=kv_caches, start_pos=0)
@@ -77,11 +141,13 @@ def generate(model, prompt_ids, max_new_tokens, temperature, top_p, device, stop
 
     generated = []
     for _ in range(max_new_tokens):
-        next_id = sample_token(next_logits, temperature, top_p)
+        next_logits = apply_repetition_penalty(next_logits, seen_ids, repetition_penalty)
+        next_id = sample_token(next_logits, temperature, top_p, top_k)
         tok = next_id.item()
         if tok in stop_ids:
             break
         generated.append(tok)
+        seen_ids.add(tok)
         if start_pos >= config.max_seq_len:
             break  # ran out of cache room
         with dtype_ctx:
@@ -107,7 +173,9 @@ def chat_turn(model, tokenizer, messages, args, device, stop_ids):
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
     if tokenizer.bos_token_id is not None:
         prompt_ids = [tokenizer.bos_token_id] + prompt_ids
-    gen_ids = generate(model, prompt_ids, args.max_new_tokens, args.temperature, args.top_p, device, stop_ids)
+    gen_ids = generate(model, prompt_ids, args.max_new_tokens, args.temperature, args.top_p, device, stop_ids,
+                        use_kv_cache=not args.no_kv_cache, repetition_penalty=args.repetition_penalty,
+                        compute_dtype=args.compute_dtype, top_k=args.top_k)
     raw_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
     content, tool_calls = parse_tool_calls(raw_text)
     return content, tool_calls
@@ -120,6 +188,14 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--top_k", type=int, default=0,
+                         help="0 disables top-k. On a poorly-calibrated (e.g. undertrained) model, "
+                              "top-p alone can still leave a very long low-probability tail available "
+                              "to sample from -- a hard cap like 40-50 restricts candidates further.")
+    parser.add_argument("--repetition_penalty", type=float, default=1.0,
+                         help="HF-style repetition penalty (1.0 = disabled). Values like 1.1-1.3 "
+                              "discourage the model from re-emitting already-seen tokens -- useful "
+                              "for an undertrained checkpoint that loops/repeats instead of stopping.")
     # raw completion mode
     parser.add_argument("--prompt", type=str, default=None)
     # chat mode
@@ -127,9 +203,27 @@ def main():
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--user", type=str, default=None)
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--no_kv_cache", action="store_true",
+                         help="recompute the full sequence from scratch every step instead of using a KV "
+                              "cache (much slower, but matches training's numerics exactly -- useful for "
+                              "sanity-checking an early/undertrained checkpoint whose cached generations "
+                              "look worse than its real quality due to bf16 rounding differences)")
+    parser.add_argument("--device", type=str, default=None,
+                         help="e.g. cuda:0, cuda:3, cpu. Defaults to cuda (device 0) if available else cpu. "
+                              "Useful to pin inference to a spare/idle GPU (or cpu) so it doesn't contend "
+                              "with a training job already using the other GPUs.")
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"],
+                         help="compute precision for both autocast and the KV cache (training used bf16, "
+                              "so that's the default, but bf16's low mantissa precision can amplify cached "
+                              "-decoding numerical divergence on an undertrained checkpoint -- try fp32 "
+                              "(slow but most faithful) or fp16 to check whether precision, not the "
+                              "checkpoint itself, explains a quality gap vs. another inference engine)")
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    args.compute_dtype = dtype_map[args.dtype]
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -172,7 +266,9 @@ def main():
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         if tokenizer.bos_token_id is not None:
             prompt_ids = [tokenizer.bos_token_id] + prompt_ids
-        gen_ids = generate(model, prompt_ids, args.max_new_tokens, args.temperature, args.top_p, device, stop_ids)
+        gen_ids = generate(model, prompt_ids, args.max_new_tokens, args.temperature, args.top_p, device, stop_ids,
+                            use_kv_cache=not args.no_kv_cache, repetition_penalty=args.repetition_penalty,
+                            compute_dtype=args.compute_dtype, top_k=args.top_k)
         print(prompt + tokenizer.decode(gen_ids, skip_special_tokens=True))
 
 

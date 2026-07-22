@@ -39,3 +39,6 @@ wandb/
 
 # Jupyter
 .ipynb_checkpoints/
+
+prompt.md
+debug_*.py
