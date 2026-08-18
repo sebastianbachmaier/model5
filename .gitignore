@@ -42,3 +42,7 @@ wandb/
 
 prompt.md
 debug_*.py
+gguf/
+hf_export/
+execute_from_hf.py
+convert_gguf_to_weights.py
