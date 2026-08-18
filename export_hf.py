@@ -13,13 +13,13 @@ much more reliable than reimplementing that by hand.
 
 Usage:
     python export_hf.py --checkpoint checkpoints/sft/sft_final.pt \
-        --out_dir hf_export/model3-sft --chat
+        --out_dir hf_export/model5-sft --chat
 
     # then, in a clone of https://github.com/ggml-org/llama.cpp :
-    python convert_hf_to_gguf.py /path/to/hf_export/model3-sft \
-        --outfile model3.gguf --outtype f16
+    python convert_hf_to_gguf.py /path/to/hf_export/model5-sft \
+        --outfile model5.gguf --outtype f16
     # optionally quantize:
-    ./llama-quantize model3.gguf model3-q4_k_m.gguf Q4_K_M
+    ./llama-quantize model5.gguf model5-q4_k_m.gguf Q4_K_M
 """
 import argparse
 import json
@@ -178,7 +178,7 @@ def main():
     print(f"saved HF checkpoint -> {args.out_dir}")
     print("next: in a clone of https://github.com/ggml-org/llama.cpp, run")
     print(f"  python convert_hf_to_gguf.py {os.path.abspath(args.out_dir)} "
-          f"--outfile model3.gguf --outtype f16")
+          f"--outfile model5.gguf --outtype f16")
 
 
 if __name__ == "__main__":
